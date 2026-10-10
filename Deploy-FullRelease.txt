@@ -1,0 +1,1640 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    WSI FULL RELEASE - Windows deployment.
+
+.DESCRIPTION
+    Standalone deployment implementation for the GitLab FULL_RELEASE
+    Windows deployment flow.
+
+    The deployment logic is taken from the current uploaded
+    release/full-release.yml. It is separated from YAML only to make the
+    GitLab job execution explicit and maintainable.
+
+    CONFIGURATION
+    -------------
+    Configuration values are read from variables/DataService.yml (in the
+    repository, on the GitLab Runner) and applied to these files on the
+    destination server:
+
+        BasePaths.json
+        ServiceSettings.json
+        httpsettings.json
+
+    Sources, per service (later wins):
+        variables/DataService.yml                    common values
+        variables/Dataservice/<ModuleName>.yml       service-specific values,
+                                                     e.g. Kestrel.Endpoints.Http.Url
+    service_name, artifact_name, port and installer_relative_path in the
+    per-service file are not written to JSON; they are usable as tokens.
+
+    Tokens may be written ${Name} or $(Name). Besides CI/CD variables they
+    resolve from the 'variables:' block of DataService.yml and from
+    variables/variables.yml (e.g. $(DataServiceIP), $(WSICoreDataServicePort)).
+
+    A value is replaced ONLY when the same key already exists in the JSON
+    file. Keys that are not present in a file are skipped. Nothing is ever
+    added to the JSON files.
+
+    Nested YAML keys map to nested JSON keys:
+
+        Paths:
+          ConfigPath: "E:\WSI\..."      ->  { "Paths": { "ConfigPath": ... } }
+
+    Optional ${Name} tokens can be used inside YAML values. They are
+    resolved per service on the runner, from:
+
+        ${BasePath} ${ServiceName} ${ArtifactName} ${Version} ${ReleaseVersion}
+        and then any GitLab CI/CD / environment variable, e.g. ${SQL_PASS}
+
+    Example:
+
+        BasePath: "${BasePath}"
+        Paths:
+          ConfigPath: "${BasePath}\Base\Config"
+        ConnectionStrings:
+          WSINFMDBConnectionString: "Server=${DATASERVICE_SERVER_NAME};Database=${DATASERVICE_NFM_DATABASE};User=${SQL_USER};Password=${SQL_PASS};${DATASERVICE_DB_OPTIONS}"
+
+    YAML values are taken literally: write Windows paths with single
+    backslashes.
+#>
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "=================================================="
+Write-Host "WSI FULL RELEASE - WINDOWS DEPLOYMENT JOB STARTED"
+Write-Host "Runner : $env:COMPUTERNAME"
+Write-Host "Release: $env:RELEASE_VERSION"
+Write-Host "Target : hotwvuwsiapp01.uabtst.ae"
+Write-Host "=================================================="
+
+Write-Host "=================================================="
+Write-Host "WSI FULL RELEASE - WINDOWS DEPLOYMENT"
+Write-Host "=================================================="
+
+# ------------------------------------------------------
+# Target
+# ------------------------------------------------------
+
+$TargetServer = "hotwvuwsiapp01.uabtst.ae"
+
+$Username = "uabtst\syspadmakar"
+
+if (-not $env:USER_PASSWD) {
+    throw "USER_PASSWD GitLab CI/CD variable is not available."
+}
+
+# ------------------------------------------------------
+# Function: read simple YAML (nested maps of scalars)
+# ------------------------------------------------------
+#
+# Returns a flat hashtable with dotted keys, e.g.
+#   BasePath
+#   Paths.ConfigPath
+#
+# PowerShell 5.1 has no built-in YAML parser, so this handles the
+# subset used by variables/DataService.yml: "key: value" pairs and
+# nested maps by indentation. Lists and multi-line values are rejected.
+# ------------------------------------------------------
+
+function Read-SimpleYaml {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $Values = @{}
+    $Stack = New-Object System.Collections.ArrayList
+    $LineNumber = 0
+
+    foreach ($Line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+
+        $LineNumber++
+
+        # Blank lines, comments, document markers
+        if ($Line -match '^\s*(#.*)?$') { continue }
+        if ($Line -match '^\s*(---|\.\.\.)\s*$') { continue }
+
+        if ($Line -match '^ *\t') {
+            throw "$Path line ${LineNumber}: tabs are not allowed for indentation."
+        }
+
+        if ($Line -match '^\s*-(\s|$)') {
+            throw "$Path line ${LineNumber}: YAML lists are not supported."
+        }
+
+        if ($Line -notmatch '^( *)([^\s:#][^:]*?)\s*:(?:\s+(.*))?$') {
+            throw "$Path line ${LineNumber}: cannot parse '$Line'. Expected 'key: value'."
+        }
+
+        $Indent = $Matches[1].Length
+        $Key = $Matches[2].Trim().Trim('"', "'")
+        $RawValue = ""
+
+        if ($Matches[3]) {
+            $RawValue = $Matches[3].Trim()
+        }
+
+        if ($RawValue.StartsWith("#")) {
+            $RawValue = ""
+        }
+
+        # Leave any nested maps we have moved out of
+        while ($Stack.Count -gt 0 -and $Stack[$Stack.Count - 1].Indent -ge $Indent) {
+            $Stack.RemoveAt($Stack.Count - 1)
+        }
+
+        # "key:" with no value starts a nested map
+        if ($RawValue -eq "") {
+            [void]$Stack.Add(@{ Indent = $Indent; Key = $Key })
+            continue
+        }
+
+        if ($RawValue -match '^[|>\[{&*]') {
+            throw "$Path line ${LineNumber}: only plain 'key: value' entries are supported."
+        }
+
+        if ($RawValue -match '^"(.*)"\s*(#.*)?$') {
+            $Value = $Matches[1]
+        }
+        elseif ($RawValue -match "^'(.*)'\s*(#.*)?$") {
+            $Value = $Matches[1] -replace "''", "'"
+        }
+        else {
+            $Value = ($RawValue -replace '\s+#.*$', '').Trim()
+        }
+
+        $FullKey = (@($Stack | ForEach-Object { $_.Key }) + $Key) -join "."
+
+        if ($Values.ContainsKey($FullKey)) {
+            throw "$Path line ${LineNumber}: duplicate key '$FullKey'."
+        }
+
+        $Values[$FullKey] = $Value
+    }
+
+    return $Values
+}
+
+# ------------------------------------------------------
+# Function: resolve ${Name} tokens in YAML values
+# ------------------------------------------------------
+
+function Resolve-ConfigurationTokens {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [hashtable]$Values,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Tokens,
+
+        # Fallback values from the "variables:" block of DataService.yml.
+        # Used only when no CI/CD / environment variable of that name exists.
+        [hashtable]$Defaults = @{}
+    )
+
+    $Resolved = @{}
+    $Missing = New-Object System.Collections.Generic.List[string]
+
+    foreach ($Key in $Values.Keys) {
+
+        $Resolved[$Key] = [regex]::Replace(
+            [string]$Values[$Key],
+            '\$(?:\{([A-Za-z_][A-Za-z0-9_.]*)\}|\(([A-Za-z_][A-Za-z0-9_.]*)\))',
+            {
+                param($Match)
+
+                # ${Name} or $(Name) (Azure DevOps style, used in the
+                # per-service files, e.g. $(DataServiceIP)).
+                $Name = $Match.Groups[1].Value
+
+                if ([string]::IsNullOrEmpty($Name)) {
+                    $Name = $Match.Groups[2].Value
+                }
+
+                if ($Tokens.ContainsKey($Name)) {
+                    return [string]$Tokens[$Name]
+                }
+
+                $EnvValue = [Environment]::GetEnvironmentVariable($Name)
+
+                if (-not [string]::IsNullOrEmpty($EnvValue)) {
+                    return $EnvValue
+                }
+
+                if ($Defaults.ContainsKey($Name)) {
+                    return [string]$Defaults[$Name]
+                }
+
+                $Missing.Add("$Key uses $($Match.Value)")
+                return $Match.Value
+            }
+        )
+    }
+
+    if ($Missing.Count -gt 0) {
+        throw "Unresolved tokens in DataService configuration (no matching CI/CD variable or value in variables/variables.yml): $($Missing -join '; ')"
+    }
+
+    return $Resolved
+}
+
+# ------------------------------------------------------
+# Load variables/DataService.yml (fail before connecting)
+# ------------------------------------------------------
+
+$DataServiceYamlPath = Join-Path `
+    $env:CI_PROJECT_DIR `
+    "variables\DataService.yml"
+
+$YamlValues = @{}
+
+if (Test-Path -LiteralPath $DataServiceYamlPath) {
+    $YamlValues = Read-SimpleYaml -Path $DataServiceYamlPath
+}
+else {
+    Write-Warning "Not found: $DataServiceYamlPath. Only the generated path values will be applied."
+}
+
+# ------------------------------------------------------
+# Split the "variables:" block out of the YAML.
+#
+# DataService.yml is no longer included by .gitlab-ci.yml, so its
+# "variables:" entries (DATASERVICE_SERVER_NAME, ...) are NOT GitLab
+# CI/CD variables any more. Use them here as token values for ${Name},
+# and do not treat them as JSON keys to transform.
+# ------------------------------------------------------
+
+$YamlVariables = @{}
+
+foreach ($YamlKey in @($YamlValues.Keys)) {
+    if ($YamlKey -like 'variables.*') {
+        $YamlVariables[$YamlKey.Substring('variables.'.Length)] = $YamlValues[$YamlKey]
+        $YamlValues.Remove($YamlKey)
+    }
+}
+
+Write-Host ""
+Write-Host "Loaded $($YamlVariables.Count) token variable(s) from the 'variables:' block:"
+
+foreach ($VarName in ($YamlVariables.Keys | Sort-Object)) {
+    Write-Host "  $VarName"
+}
+
+Write-Host ""
+Write-Host "Loaded $($YamlValues.Count) configuration value(s) from $DataServiceYamlPath"
+
+foreach ($YamlKey in ($YamlValues.Keys | Sort-Object)) {
+    Write-Host "  $YamlKey"
+}
+
+# ------------------------------------------------------
+# Load variables/variables.yml (shared platform values)
+# ------------------------------------------------------
+#
+# e.g. ports.DataServiceIP, ports.WSICoreDataServicePort
+#
+# Each value is available as a token by its full dotted name
+# ($(ports.DataServiceIP)) and by its last segment
+# ($(DataServiceIP)).
+# ------------------------------------------------------
+
+$PlatformVariablesPath = Join-Path `
+    $env:CI_PROJECT_DIR `
+    "variables\variables.yml"
+
+$PlatformVariables = @{}
+
+if (Test-Path -LiteralPath $PlatformVariablesPath) {
+
+    $PlatformRaw = Read-SimpleYaml -Path $PlatformVariablesPath
+
+    foreach ($PlatformKey in $PlatformRaw.Keys) {
+
+        $PlatformVariables[$PlatformKey] = $PlatformRaw[$PlatformKey]
+
+        $Leaf = ($PlatformKey -split '\.')[-1]
+
+        if ($Leaf -ne $PlatformKey) {
+
+            if ($PlatformVariables.ContainsKey($Leaf) -and $PlatformVariables[$Leaf] -ne $PlatformRaw[$PlatformKey]) {
+                throw "${PlatformVariablesPath}: '$Leaf' is defined more than once with different values. Use the full name, e.g. `$($PlatformKey)."
+            }
+
+            $PlatformVariables[$Leaf] = $PlatformRaw[$PlatformKey]
+        }
+    }
+}
+else {
+    Write-Warning "Not found: $PlatformVariablesPath"
+}
+
+Write-Host ""
+Write-Host "Loaded $($PlatformVariables.Count) token variable(s) from $PlatformVariablesPath"
+
+# DataService.yml 'variables:' block wins over variables.yml.
+$TokenDefaults = @{}
+
+foreach ($K in $PlatformVariables.Keys) { $TokenDefaults[$K] = $PlatformVariables[$K] }
+foreach ($K in $YamlVariables.Keys)     { $TokenDefaults[$K] = $YamlVariables[$K] }
+
+# ------------------------------------------------------
+# Per-service files: variables/Dataservice/<ModuleName>.yml
+# ------------------------------------------------------
+#
+# Service-specific configuration (e.g. Kestrel.Endpoints.Http.Url)
+# lives here and overrides the common values in DataService.yml for
+# that service only.
+#
+# These top-level keys describe the service itself and are NOT
+# written to the JSON files. They are available as tokens instead
+# (e.g. ${port}):
+# ------------------------------------------------------
+
+$ServiceMetadataKeys = @(
+    "service_name",
+    "artifact_name",
+    "port",
+    "installer_relative_path"
+)
+
+$ServiceVariablesRoot = Join-Path `
+    $env:CI_PROJECT_DIR `
+    "variables\Dataservice"
+
+# ------------------------------------------------------
+# Create credential
+# ------------------------------------------------------
+
+$SecurePassword = ConvertTo-SecureString `
+    $env:USER_PASSWD `
+    -AsPlainText `
+    -Force
+
+$Credential = New-Object `
+    System.Management.Automation.PSCredential(
+        $Username,
+        $SecurePassword
+    )
+
+# ------------------------------------------------------
+# Create PS Remoting session
+# ------------------------------------------------------
+
+Write-Host ""
+Write-Host "Connecting to:"
+Write-Host $TargetServer
+
+$Session = New-PSSession `
+    -ComputerName $TargetServer `
+    -Credential $Credential
+
+if (-not $Session) {
+    throw "Unable to create PowerShell Remoting session."
+}
+
+Write-Host "PowerShell Remoting session established."
+
+try {
+
+    # --------------------------------------------------
+    # Product definitions
+    # --------------------------------------------------
+
+    $Products = @(
+        @{
+            ModuleName   = "WSICoreDataService"
+            Version      = "1.0.36"
+            ServiceName  = "$env:ENV_PREFIX" + "wsi-core-gateway-service"
+            ArtifactName = "gw-wsi-core-gateway-service"
+        },
+        @{
+            ModuleName   = "WSINFMDataService"
+            Version      = "1.0.26"
+            ServiceName  = "$env:ENV_PREFIX" + "wsi-nfm-gateway-service"
+            ArtifactName = "gw-wsi-nfm-gateway-service"
+        },
+        @{
+            ModuleName   = "WSIOfflineDataService"
+            Version      = "1.0.31"
+            ServiceName  = "$env:ENV_PREFIX" + "wsi-offline-gateway-service"
+            ArtifactName = "gw-wsi-offline-gateway-service"
+        },
+        @{
+            ModuleName   = "WSISFTPCoreDataService"
+            Version      = "1.0.23"
+            ServiceName  = "$env:ENV_PREFIX" + "sftp-wsi-core-gateway-service"
+            ArtifactName = "sftp-wsi-core-gateway-service"
+        }
+    )
+
+    # --------------------------------------------------
+    # Deploy each service
+    # --------------------------------------------------
+
+    foreach ($Product in $Products) {
+
+        Write-Host ""
+        Write-Host "=================================================="
+        Write-Host "Deploying: $($Product.ModuleName)"
+        Write-Host "Service  : $($Product.ServiceName)"
+        Write-Host "Version  : $($Product.Version)"
+        Write-Host "=================================================="
+
+        $LocalZip = Join-Path `
+            $env:CI_PROJECT_DIR `
+            "full-release\$($Product.ArtifactName)-$($Product.Version).zip"
+
+        if (-not (Test-Path $LocalZip)) {
+            throw "Local artifact not found: $LocalZip"
+        }
+
+        # ------------------------------------------------
+        # Target paths
+        # ------------------------------------------------
+        #
+        # IMPORTANT:
+        # These paths exist on the Windows target server,
+        # NOT on the GitLab Runner.
+        #
+        # Therefore construct them inside the
+        # PowerShell Remoting session.
+        # ------------------------------------------------
+
+        $RemotePaths = Invoke-Command `
+            -Session $Session `
+            -ArgumentList `
+                $env:WINDOWS_SOURCE_DIR,
+                $env:WINDOWS_SERVICE_ROOT,
+                $env:RELEASE_VERSION,
+                $Product.ServiceName,
+                $Product.ArtifactName,
+                $Product.Version `
+            -ScriptBlock {
+
+                param(
+                    $WindowsSourceDir,
+                    $WindowsServiceRoot,
+                    $ReleaseVersion,
+                    $ServiceName,
+                    $ArtifactName,
+                    $Version
+                )
+
+                $ReleaseSourceRoot = Join-Path `
+                    $WindowsSourceDir `
+                    $ReleaseVersion
+
+                $ServiceSourceRoot = Join-Path `
+                    $ReleaseSourceRoot `
+                    "services"
+
+                $BasePath = Join-Path `
+                    $WindowsServiceRoot `
+                    $ServiceName
+
+                $RemoteZip = Join-Path `
+                    $ServiceSourceRoot `
+                    "$ArtifactName-$Version.zip"
+
+                [PSCustomObject]@{
+                    ReleaseSourceRoot = $ReleaseSourceRoot
+                    ServiceSourceRoot = $ServiceSourceRoot
+                    BasePath          = $BasePath
+                    RemoteZip         = $RemoteZip
+                }
+            }
+
+        $ReleaseSourceRoot = $RemotePaths.ReleaseSourceRoot
+        $ServiceSourceRoot = $RemotePaths.ServiceSourceRoot
+        $BasePath          = $RemotePaths.BasePath
+        $RemoteZip         = $RemotePaths.RemoteZip
+
+        # ------------------------------------------------
+        # Build configuration for this service:
+        #   common  : variables/DataService.yml
+        #   service : variables/Dataservice/<ModuleName>.yml (wins)
+        # ------------------------------------------------
+
+        $ServiceValues = @{}
+
+        foreach ($K in $YamlValues.Keys) {
+            $ServiceValues[$K] = $YamlValues[$K]
+        }
+
+        $ServiceTokenDefaults = @{}
+
+        foreach ($K in $TokenDefaults.Keys) {
+            $ServiceTokenDefaults[$K] = $TokenDefaults[$K]
+        }
+
+        $ServiceFile = Join-Path `
+            $ServiceVariablesRoot `
+            "$($Product.ModuleName).yml"
+
+        if (Test-Path -LiteralPath $ServiceFile) {
+
+            $ServiceYaml = Read-SimpleYaml -Path $ServiceFile
+
+            Write-Host ""
+            Write-Host "Service configuration: $ServiceFile"
+
+            foreach ($K in ($ServiceYaml.Keys | Sort-Object)) {
+
+                if ($ServiceMetadataKeys -contains $K) {
+                    $ServiceTokenDefaults[$K] = $ServiceYaml[$K]
+                    continue
+                }
+
+                if ($ServiceValues.ContainsKey($K)) {
+                    Write-Host "  $K (overrides DataService.yml)"
+                }
+                else {
+                    Write-Host "  $K"
+                }
+
+                $ServiceValues[$K] = $ServiceYaml[$K]
+            }
+        }
+        else {
+            Write-Warning "No service configuration file: $ServiceFile. Only DataService.yml values will be applied."
+        }
+
+        $ResolvedValues = Resolve-ConfigurationTokens `
+            -Values $ServiceValues `
+            -Defaults $ServiceTokenDefaults `
+            -Tokens @{
+                BasePath       = $BasePath
+                ServiceName    = $Product.ServiceName
+                ArtifactName   = $Product.ArtifactName
+                Version        = $Product.Version
+                ReleaseVersion = $env:RELEASE_VERSION
+                ENV_PREFIX     = [string]$env:ENV_PREFIX
+            }
+
+        # ------------------------------------------------
+        # Create source directory
+        # ------------------------------------------------
+
+        Invoke-Command `
+            -Session $Session `
+            -ScriptBlock {
+
+                param(
+                    $SourceRoot,
+                    $ServiceSourceRoot
+                )
+
+                if (-not (Test-Path $SourceRoot)) {
+
+                    New-Item `
+                        -ItemType Directory `
+                        -Path $SourceRoot `
+                        -Force | Out-Null
+
+                    Write-Host "Created: $SourceRoot"
+                }
+
+                if (-not (Test-Path $ServiceSourceRoot)) {
+
+                    New-Item `
+                        -ItemType Directory `
+                        -Path $ServiceSourceRoot `
+                        -Force | Out-Null
+
+                    Write-Host "Created: $ServiceSourceRoot"
+                }
+
+            } `
+            -ArgumentList `
+                $ReleaseSourceRoot,
+                $ServiceSourceRoot
+
+        # ------------------------------------------------
+        # Copy ZIP from GitLab Runner to target
+        # ------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Copying artifact to target..."
+        Write-Host "Source : $LocalZip"
+        Write-Host "Target : $RemoteZip"
+
+        Copy-Item `
+            -Path $LocalZip `
+            -Destination $RemoteZip `
+            -ToSession $Session `
+            -Force
+
+        Write-Host "Artifact copied successfully."
+
+        # ------------------------------------------------
+        # Remote deployment
+        # ------------------------------------------------
+
+        Invoke-Command `
+            -Session $Session `
+            -ScriptBlock {
+
+                param(
+                    $ServiceName,
+                    $ArtifactName,
+                    $Version,
+                    $ReleaseVersion,
+                    $BasePath,
+                    $RemoteZip,
+                    $BackupRoot,
+                    $IdentityUsername,
+                    $ApplicationDrive,
+                    $ProjectName,
+                    $ServiceRunAsUsername,
+                    $ServiceRunAsPassword,
+                    $DataServiceServerName,
+                    $DataServiceDbPrefix,
+                    $DataServiceIpiPayDatabase,
+                    $DataServiceNfmDatabase,
+                    $DataServiceRuntimeDatabase,
+                    $DataServiceDbOptions,
+                    $SqlUser,
+                    $SqlPass,
+                    $ConfigurationValues
+                )
+
+                $ErrorActionPreference = "Stop"
+
+                # ==================================================
+                # DataService configuration variables
+                # ==================================================
+
+                $env:DATASERVICE_SERVER_NAME = $DataServiceServerName
+                $env:SQL_USER = $SqlUser
+                $env:SQL_PASS = $SqlPass
+                $env:DATASERVICE_DB_PREFIX = $DataServiceDbPrefix
+                $env:DATASERVICE_IPIPAY_DATABASE = $DataServiceIpiPayDatabase
+                $env:DATASERVICE_NFM_DATABASE = $DataServiceNfmDatabase
+                $env:DATASERVICE_RUNTIME_DATABASE = $DataServiceRuntimeDatabase
+                $env:DATASERVICE_DB_OPTIONS = $DataServiceDbOptions
+
+                Write-Host ""
+                Write-Host "----------------------------------------------"
+                Write-Host "Remote deployment"
+                Write-Host "Service : $ServiceName"
+                Write-Host "BasePath: $BasePath"
+                Write-Host "----------------------------------------------"
+
+                # ==========================================
+                # 1. STOP SERVICE
+                # ==========================================
+                #
+                # Service registration is intentionally preserved.
+                #
+                # If the service already exists:
+                #   1. Find service
+                #   2. Stop if running
+                #   3. Wait up to 30 seconds
+                #   4. Kill service PID if still running
+                #
+                # We DO NOT delete the Windows service registration.
+                # The same service will be started again after deployment.
+                # ==========================================
+
+                Write-Host ""
+                Write-Host "Checking service: $ServiceName"
+
+                $Service = Get-CimInstance `
+                    Win32_Service `
+                    -Filter "Name='$ServiceName'"
+
+                if ($Service) {
+
+                    Write-Host "Service registration already exists."
+
+                    if ($Service.State -eq "Running") {
+
+                        Write-Host "Service is running."
+
+                        # Capture the service PID BEFORE stopping the service.
+                        # Once the service reaches Stopped state, Win32_Service
+                        # can report ProcessId as 0 even when a process still
+                        # has application files/logs open.
+                        $OriginalServiceProcessId = 0
+
+                        if ($Service.ProcessId -gt 0) {
+                            $OriginalServiceProcessId = [int]$Service.ProcessId
+                            Write-Host "Service process PID captured: $OriginalServiceProcessId"
+                        }
+
+                        Write-Host "Stopping service: $ServiceName"
+
+                        Stop-Service `
+                            -Name $ServiceName `
+                            -Force `
+                            -ErrorAction SilentlyContinue
+
+                        $TimeoutSeconds = 30
+                        $ElapsedSeconds = 0
+
+                        Write-Host "Waiting up to $TimeoutSeconds seconds for service to stop..."
+
+                        while ($ElapsedSeconds -lt $TimeoutSeconds) {
+
+                            Start-Sleep -Seconds 1
+                            $ElapsedSeconds++
+
+                            $Service = Get-CimInstance `
+                                Win32_Service `
+                                -Filter "Name='$ServiceName'"
+
+                            if (-not $Service) {
+                                break
+                            }
+
+                            if ($Service.State -ne "Running") {
+                                break
+                            }
+                        }
+
+                        # ------------------------------------------------
+                        # Vendor fallback:
+                        # If the service did not stop within 30 seconds,
+                        # force terminate its process.
+                        # ------------------------------------------------
+
+                        $Service = Get-CimInstance `
+                            Win32_Service `
+                            -Filter "Name='$ServiceName'"
+
+                        if ($Service -and $Service.State -eq "Running") {
+
+                            Write-Warning `
+                                "Service did not stop within $TimeoutSeconds seconds."
+
+                            if ($Service.ProcessId -gt 0) {
+
+                                $ServiceProcessId = $Service.ProcessId
+
+                                Write-Warning `
+                                    "Force stopping service process PID $ServiceProcessId..."
+
+                                Stop-Process `
+                                    -Id $ServiceProcessId `
+                                    -Force `
+                                    -ErrorAction SilentlyContinue
+
+                                Write-Host "Waiting for service process PID $ServiceProcessId to exit..."
+
+                                $ProcessWaitSeconds = 15
+                                $ProcessElapsedSeconds = 0
+
+                                while ($ProcessElapsedSeconds -lt $ProcessWaitSeconds) {
+
+                                    $ServiceProcess = Get-Process `
+                                        -Id $ServiceProcessId `
+                                        -ErrorAction SilentlyContinue
+
+                                    if (-not $ServiceProcess) {
+                                        break
+                                    }
+
+                                    Start-Sleep -Seconds 1
+                                    $ProcessElapsedSeconds++
+                                }
+
+                                $RemainingProcess = Get-Process `
+                                    -Id $ServiceProcessId `
+                                    -ErrorAction SilentlyContinue
+
+                                if ($RemainingProcess) {
+
+                                    throw `
+                                        "Service process PID $ServiceProcessId is still running after force stop."
+                                }
+
+                                Write-Host `
+                                    "Service process PID $ServiceProcessId terminated successfully."
+                            }
+                        }
+
+                        # Verify service is no longer running.
+                        $Service = Get-CimInstance `
+                            Win32_Service `
+                            -Filter "Name='$ServiceName'"
+
+                        if ($Service -and $Service.State -eq "Running") {
+
+                            throw `
+                                "Unable to stop Windows service '$ServiceName'."
+                        }
+
+                        Write-Host "Service stopped successfully."
+                    }
+                    else {
+
+                        Write-Host `
+                            "Service state is '$($Service.State)'. No stop required."
+                    }
+
+                }
+                else {
+
+                    Write-Host "Service does not exist. It will be installed after deployment."
+                }
+
+                # A Windows service can report Stopped while its process
+                # or child process still holds a file handle. The PID was
+                # captured BEFORE Stop-Service above, so use that original
+                # PID here even if Win32_Service now reports PID 0.
+                Write-Host ""
+                Write-Host "Checking for remaining service process..."
+
+                if ($OriginalServiceProcessId -gt 0) {
+
+                    $RemainingProcess = Get-Process `
+                        -Id $OriginalServiceProcessId `
+                        -ErrorAction SilentlyContinue
+
+                    if ($RemainingProcess) {
+
+                        Write-Warning `
+                            "Service process PID $OriginalServiceProcessId is still present after stop."
+
+                        Write-Host `
+                            "Force terminating service process tree PID $OriginalServiceProcessId..."
+
+                        & taskkill.exe `
+                            /PID $OriginalServiceProcessId `
+                            /T `
+                            /F | Out-Host
+
+                        if ($LASTEXITCODE -ne 0) {
+                            throw `
+                                "Unable to terminate service process tree for PID $OriginalServiceProcessId. taskkill exit code: $LASTEXITCODE"
+                        }
+
+                        Write-Host "Waiting 15 seconds for process termination and file handles to release..."
+                        Start-Sleep -Seconds 15
+
+                        $RemainingProcess = Get-Process `
+                            -Id $OriginalServiceProcessId `
+                            -ErrorAction SilentlyContinue
+
+                        if ($RemainingProcess) {
+                            throw `
+                                "Service process PID $OriginalServiceProcessId is still running after forced termination."
+                        }
+
+                        Write-Host "Service process tree terminated successfully."
+                    }
+                    else {
+                        Write-Host "Service process PID $OriginalServiceProcessId is no longer running."
+                    }
+                }
+                else {
+                    Write-Host "No service PID was captured. Skipping process termination check."
+                }
+
+                # Give Windows additional time to release file handles before
+                # Compress-Archive reads the application directory.
+                Write-Host "Allowing Windows file handles to settle..."
+                Start-Sleep -Seconds 5
+
+                # ==========================================
+                # 2. BACKUP EXISTING APPLICATION
+                # ==========================================
+
+                $BasePathExists = Test-Path $BasePath
+
+                $CurrentDate = Get-Date -Format "yyyyMMdd"
+                $CurrentTime = Get-Date -Format "HHmmss"
+
+                $BackupDatePath = Join-Path `
+                    $BackupRoot `
+                    $CurrentDate
+
+                $BackupDataServicePath = Join-Path `
+                    $BackupDatePath `
+                    "Dataservice"
+
+                if ($BasePathExists) {
+
+                    Write-Host ""
+                    Write-Host "Creating backup..."
+
+                    if (-not (Test-Path $BackupDataServicePath)) {
+
+                        New-Item `
+                            -ItemType Directory `
+                            -Path $BackupDataServicePath `
+                            -Force | Out-Null
+                    }
+
+                    $BackupFile = Join-Path `
+                        $BackupDataServicePath `
+                        "$ServiceName-$CurrentTime.zip"
+
+                    $BackupAttempts = 3
+                    $BackupSucceeded = $false
+
+                    for ($BackupAttempt = 1; $BackupAttempt -le $BackupAttempts; $BackupAttempt++) {
+
+                        try {
+                            Write-Host "Creating backup archive (attempt $BackupAttempt of $BackupAttempts)..."
+
+                            Compress-Archive `
+                                -Path "$BasePath\*" `
+                                -DestinationPath $BackupFile `
+                                -Force `
+                                -ErrorAction Stop
+
+                            $BackupSucceeded = $true
+                            break
+                        }
+                        catch {
+
+                            if ($BackupAttempt -eq $BackupAttempts) {
+                                throw
+                            }
+
+                            Write-Warning "Backup attempt $BackupAttempt failed: $($_.Exception.Message)"
+                            Write-Host "Waiting 5 seconds before retry..."
+                            Start-Sleep -Seconds 5
+                        }
+                    }
+
+                    if (-not $BackupSucceeded) {
+                        throw "Unable to create backup archive: $BackupFile"
+                    }
+
+                    Write-Host "Backup created:"
+                    Write-Host $BackupFile
+                }
+                else {
+                    Write-Host "BasePath does not exist. Backup skipped."
+                }
+
+                # ==========================================
+                # 3. BACKUP LOGS / CLEAN OLD FILES
+                # ==========================================
+
+                # Remove a file/folder, retrying while Windows releases handles.
+                #
+                # A folder can stay locked after everything inside it is gone
+                # (e.g. an Explorer/cmd/PowerShell window or RDP session whose
+                # current directory is that folder, or antivirus scanning it
+                # right after the backup). In that case the folder is left in
+                # place EMPTY and the deployment continues: Expand-Archive
+                # -Force writes the new files into it.
+                function Remove-PathWithRetry {
+                    param(
+                        [Parameter(Mandatory)][string]$Path,
+                        [int]$Attempts = 6,
+                        [int]$DelaySeconds = 5
+                    )
+
+                    for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+
+                        try {
+                            Remove-Item `
+                                -LiteralPath $Path `
+                                -Recurse `
+                                -Force `
+                                -ErrorAction Stop
+                            return
+                        }
+                        catch {
+                            if (-not (Test-Path -LiteralPath $Path)) {
+                                return
+                            }
+
+                            $IsDir = Test-Path -LiteralPath $Path -PathType Container
+
+                            if ($IsDir) {
+                                $Left = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)
+
+                                if ($Left.Count -eq 0 -and $Attempt -eq $Attempts) {
+                                    Write-Warning "Folder '$Path' is empty but still locked by another process. Keeping the empty folder and continuing."
+                                    return
+                                }
+                            }
+
+                            if ($Attempt -eq $Attempts) {
+
+                                Write-Host ""
+                                Write-Host "Processes that may be holding '$Path':"
+
+                                Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                                    Where-Object {
+                                        ($_.ExecutablePath -and $_.ExecutablePath -like "$BasePath*") -or
+                                        ($_.CommandLine -and $_.CommandLine -like "*$BasePath*")
+                                    } |
+                                    ForEach-Object {
+                                        Write-Host "  PID $($_.ProcessId)  $($_.Name)  $($_.CommandLine)"
+                                    }
+
+                                Write-Host "Explorer/cmd/PowerShell windows open on this folder are NOT listed above; close them on $env:COMPUTERNAME."
+                                throw
+                            }
+
+                            Write-Warning "Delete attempt $Attempt of $Attempts failed for '$Path': $($_.Exception.Message)"
+                            Write-Host "Waiting $DelaySeconds seconds before retry..."
+                            Start-Sleep -Seconds $DelaySeconds
+                        }
+                    }
+                }
+
+                if ($BasePathExists) {
+
+                    $BuildNumber = $ReleaseVersion `
+                        -replace '\.', '_'
+
+                    $Items = Get-ChildItem `
+                        -Path $BasePath
+
+                    foreach ($Item in $Items) {
+
+                        if ($Item.PSIsContainer) {
+
+                            if ($Item.Name -eq "Logs") {
+
+                                $NewName = "Logs_$BuildNumber"
+
+                                # A previous/retried deployment may already have
+                                # the same Logs_<release> directory. Preserve both
+                                # sets of logs by generating a unique destination.
+                                $LogBackupPath = Join-Path $BasePath $NewName
+
+                                if (Test-Path -LiteralPath $LogBackupPath) {
+
+                                    $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                                    $NewName = "Logs_${BuildNumber}_$Timestamp"
+                                    $LogBackupPath = Join-Path $BasePath $NewName
+
+                                    $Counter = 1
+
+                                    while (Test-Path -LiteralPath $LogBackupPath) {
+
+                                        $NewName = "Logs_${BuildNumber}_${Timestamp}_$Counter"
+                                        $LogBackupPath = Join-Path $BasePath $NewName
+                                        $Counter++
+                                    }
+
+                                    Write-Host "Existing log backup found. Using unique name: $NewName"
+                                }
+
+                                Write-Host "Renaming Logs -> $NewName"
+
+                                Rename-Item `
+                                    -Path $Item.FullName `
+                                    -NewName $NewName
+                            }
+                            elseif ($Item.Name -notlike "Logs*") {
+
+                                Write-Host "Deleting $($Item.FullName)"
+
+                                Remove-PathWithRetry -Path $Item.FullName
+                            }
+                        }
+                        else {
+
+                            Write-Host "Deleting $($Item.FullName)"
+
+                            Remove-PathWithRetry -Path $Item.FullName
+                        }
+                    }
+                }
+
+                # ==========================================
+                # 4. CREATE BASE PATH
+                # ==========================================
+
+                if (-not (Test-Path $BasePath)) {
+
+                    New-Item `
+                        -ItemType Directory `
+                        -Path $BasePath `
+                        -Force | Out-Null
+                }
+
+                # ==========================================
+                # 5. EXTRACT NEW ARTIFACT
+                # ==========================================
+
+                Write-Host ""
+                Write-Host "Extracting:"
+                Write-Host $RemoteZip
+
+                Expand-Archive `
+                    -Path $RemoteZip `
+                    -DestinationPath $BasePath `
+                    -Force
+
+                Write-Host "Artifact extracted."
+
+                # ==========================================
+                # 6. SET DIRECTORY PERMISSIONS
+                # ==========================================
+
+                Write-Host ""
+                Write-Host "Applying permissions..."
+
+                function Set-RecursivePermission {
+                    param(
+                        [string]$RootFolder
+                    )
+
+                    $Permission = "(OI)(CI)F"
+                    $GrantString = "$IdentityUsername`:$Permission"
+
+                    $Folders = Get-ChildItem `
+                        -Path $RootFolder `
+                        -Directory `
+                        -ErrorAction SilentlyContinue
+
+                    if ($null -eq $Folders) {
+                        return
+                    }
+
+                    foreach ($Folder in $Folders) {
+
+                        icacls `
+                            $Folder.FullName `
+                            /C `
+                            /Q `
+                            /grant `
+                            $GrantString
+
+                        Set-RecursivePermission `
+                            -RootFolder $Folder.FullName
+                    }
+                }
+
+                Set-RecursivePermission `
+                    -RootFolder $BasePath
+
+                # ==========================================
+                # 7. CONFIGURATION
+                # ==========================================
+                #
+                # Values come from variables/DataService.yml (read and
+                # resolved on the GitLab Runner, passed in here as
+                # $ConfigurationValues with dotted keys).
+                #
+                # Target files:
+                #   **/BasePaths.json
+                #   **/ServiceSettings.json
+                #   **/httpsettings.json
+                #
+                # REPLACE ONLY: a value is written only when the key
+                # already exists in the JSON file. Nothing is added.
+                # ==========================================
+
+                Write-Host ""
+                Write-Host "Applying DataService configuration..."
+
+                if ($null -eq $ConfigurationValues) {
+                    $ConfigurationValues = @{}
+                }
+
+                # ------------------------------------------------
+                # Path values generated during this deployment
+                # ------------------------------------------------
+                #
+                # These are calculated on the destination server for
+                # the service being deployed, and always win over a
+                # value for the same key in DataService.yml.
+                # ------------------------------------------------
+
+                $DownloadPath = Join-Path `
+                    $env:TEMP `
+                    "WSI"
+
+                if (-not (Test-Path -LiteralPath $DownloadPath)) {
+                    New-Item `
+                        -ItemType Directory `
+                        -Path $DownloadPath `
+                        -Force | Out-Null
+                }
+
+                $GeneratedValues = @{
+                    "BasePath"          = $BasePath
+                    "SourceDir"         = "${ApplicationDrive}:\WSI\Source"
+                    "DownloadPath"      = $DownloadPath
+                    "Paths.ConfigPath"  = $BasePath + "\Base\Config"
+                    "Paths.ProjectRoot" = $BasePath + "\Base\"
+                }
+
+                foreach ($GeneratedKey in $GeneratedValues.Keys) {
+
+                    if ($ConfigurationValues.ContainsKey($GeneratedKey)) {
+                        Write-Host "Using generated value for '$GeneratedKey' (DataService.yml value ignored)."
+                    }
+
+                    $ConfigurationValues[$GeneratedKey] = $GeneratedValues[$GeneratedKey]
+                }
+
+                # ------------------------------------------------
+                # Function: replace an EXISTING JSON property
+                # ------------------------------------------------
+                #
+                # Returns:
+                #   Replaced  - key existed, value changed
+                #   Unchanged - key existed, value already correct
+                #   Missing   - key not in this file, nothing done
+                # ------------------------------------------------
+
+                function Set-ExistingJsonProperty {
+                    param(
+                        [Parameter(Mandatory)]
+                        [object]$Json,
+
+                        [Parameter(Mandatory)]
+                        [string]$PropertyPath,
+
+                        [AllowEmptyString()]
+                        [string]$Value
+                    )
+
+                    $Parts = $PropertyPath.Split(".")
+                    $CurrentObject = $Json
+
+                    # Walk down to the parent object. Never create anything.
+                    for ($Index = 0; $Index -lt ($Parts.Count - 1); $Index++) {
+
+                        if ($CurrentObject -isnot [System.Management.Automation.PSCustomObject]) {
+                            return "Missing"
+                        }
+
+                        $Property = $CurrentObject.PSObject.Properties[$Parts[$Index]]
+
+                        if ($null -eq $Property -or $null -eq $Property.Value) {
+                            return "Missing"
+                        }
+
+                        $CurrentObject = $Property.Value
+                    }
+
+                    if ($CurrentObject -isnot [System.Management.Automation.PSCustomObject]) {
+                        return "Missing"
+                    }
+
+                    $FinalProperty = `
+                        $CurrentObject.PSObject.Properties[$Parts[$Parts.Count - 1]]
+
+                    if ($null -eq $FinalProperty) {
+                        return "Missing"
+                    }
+
+                    $ExistingValue = $FinalProperty.Value
+
+                    if ($ExistingValue -is [System.Management.Automation.PSCustomObject] -or
+                        $ExistingValue -is [System.Array]) {
+
+                        throw "'$PropertyPath' is an object/array in the JSON file but a single value in DataService.yml."
+                    }
+
+                    # Keep the JSON type of the existing value
+                    # (true/false and numbers stay unquoted).
+                    $NewValue = $Value
+
+                    try {
+                        if ($ExistingValue -is [bool]) {
+                            $NewValue = [System.Convert]::ToBoolean($Value)
+                        }
+                        elseif ($ExistingValue -is [System.ValueType]) {
+                            $NewValue = [System.Convert]::ChangeType(
+                                $Value,
+                                $ExistingValue.GetType(),
+                                [System.Globalization.CultureInfo]::InvariantCulture
+                            )
+                        }
+                    }
+                    catch {
+                        throw "'$PropertyPath' is $($ExistingValue.GetType().Name) in the JSON file; the DataService.yml value cannot be converted to it."
+                    }
+
+                    if ("$ExistingValue" -ceq "$NewValue") {
+                        return "Unchanged"
+                    }
+
+                    $FinalProperty.Value = $NewValue
+                    return "Replaced"
+                }
+
+                # ------------------------------------------------
+                # Function: validate + replace values in one file
+                # ------------------------------------------------
+
+                function Update-JsonConfiguration {
+                    param(
+                        [Parameter(Mandatory)]
+                        [string]$FilePath,
+                        [Parameter(Mandatory)]
+                        [hashtable]$Values
+                    )
+
+                    Write-Host ""
+                    Write-Host "Transforming: $FilePath"
+
+                    try {
+                        # Validate: file must be readable, valid JSON
+                        $Raw = Get-Content `
+                            -LiteralPath $FilePath `
+                            -Raw `
+                            -ErrorAction Stop
+
+                        if ([string]::IsNullOrWhiteSpace($Raw)) {
+                            throw "File is empty."
+                        }
+
+                        $Json = $Raw | ConvertFrom-Json -ErrorAction Stop
+
+                        $ReplacedCount = 0
+
+                        foreach ($Key in ($Values.Keys | Sort-Object)) {
+
+                            $Result = Set-ExistingJsonProperty `
+                                -Json $Json `
+                                -PropertyPath $Key `
+                                -Value $Values[$Key]
+
+                            switch ($Result) {
+                                "Replaced" {
+                                    Write-Host "  Replaced : $Key"
+                                    $ReplacedCount++
+                                }
+                                "Unchanged" {
+                                    Write-Host "  Unchanged: $Key"
+                                }
+                                default {
+                                    Write-Host "  Skipped  : $Key (not present in file)"
+                                }
+                            }
+                        }
+
+                        # Existing WSI log configuration. Replace only,
+                        # and DataService.yml wins if it defines the key.
+                        if (-not $Values.ContainsKey("ServiceSettings.LogDirectory")) {
+
+                            $LogResult = Set-ExistingJsonProperty `
+                                -Json $Json `
+                                -PropertyPath "ServiceSettings.LogDirectory" `
+                                -Value (Join-Path $BasePath "Logs")
+
+                            if ($LogResult -eq "Replaced") {
+                                Write-Host "  Replaced : ServiceSettings.LogDirectory"
+                                $ReplacedCount++
+                            }
+                        }
+
+                        if ($ReplacedCount -eq 0) {
+                            Write-Host "No values to replace. File left untouched."
+                            return
+                        }
+
+                        $Output = ConvertTo-Json `
+                            -InputObject $Json `
+                            -Depth 100
+
+                        # Validate the result before overwriting the file
+                        $null = $Output | ConvertFrom-Json -ErrorAction Stop
+
+                        Set-Content `
+                            -LiteralPath $FilePath `
+                            -Value $Output `
+                            -Encoding UTF8
+
+                        Write-Host "Successfully transformed: $FilePath ($ReplacedCount value(s) replaced)"
+                    }
+                    catch {
+                        throw "Unable to transform '$FilePath': $($_.Exception.Message)"
+                    }
+                }
+
+                # ------------------------------------------------
+                # Locate vendor FileTransform target files
+                # ------------------------------------------------
+
+                $BasePathsFiles = Get-ChildItem `
+                    -Path $BasePath `
+                    -Filter "BasePaths.json" `
+                    -Recurse `
+                    -File `
+                    -ErrorAction SilentlyContinue
+
+                $ServiceSettingsFiles = Get-ChildItem `
+                    -Path $BasePath `
+                    -Filter "ServiceSettings.json" `
+                    -Recurse `
+                    -File `
+                    -ErrorAction SilentlyContinue
+
+                $HttpSettingsFiles = Get-ChildItem `
+                    -Path $BasePath `
+                    -Filter "httpsettings.json" `
+                    -Recurse `
+                    -File `
+                    -ErrorAction SilentlyContinue
+
+                # ------------------------------------------------
+                # BasePaths.json
+                # ------------------------------------------------
+
+                foreach ($File in $BasePathsFiles) {
+                    Update-JsonConfiguration `
+                        -FilePath $File.FullName `
+                        -Values $ConfigurationValues
+                }
+
+                # ------------------------------------------------
+                # ServiceSettings.json
+                # ------------------------------------------------
+
+                foreach ($File in $ServiceSettingsFiles) {
+                    Update-JsonConfiguration `
+                        -FilePath $File.FullName `
+                        -Values $ConfigurationValues
+                }
+
+                # ------------------------------------------------
+                # httpsettings.json
+                # ------------------------------------------------
+
+                foreach ($File in $HttpSettingsFiles) {
+                    Update-JsonConfiguration `
+                        -FilePath $File.FullName `
+                        -Values $ConfigurationValues
+                }
+
+                Write-Host ""
+                Write-Host "DataService configuration completed."
+
+                # ==========================================
+                # 8. INSTALL WINDOWS SERVICE IF REQUIRED
+                # ==========================================
+                #
+                # If the service already exists, keep the existing
+                # registration and do not reinstall it.
+                #
+                # If the service does not exist, create it directly
+                # with the configured service account. This avoids
+                # running UnityWinService.exe install interactively.
+                # ==========================================
+
+                $InstallerPath = Join-Path `
+                    $BasePath `
+                    "bin\UnityWinService.exe"
+
+                if (-not (Test-Path $InstallerPath)) {
+
+                    throw "Windows service installer not found: $InstallerPath"
+                }
+
+                $InstalledService = Get-CimInstance `
+                    Win32_Service `
+                    -Filter "Name='$ServiceName'"
+
+                if ($InstalledService) {
+
+                    Write-Host ""
+                    Write-Host "Windows service already installed."
+                    Write-Host "Service : $ServiceName"
+                    Write-Host "Status  : $($InstalledService.State)"
+                    Write-Host "Skipping service installation."
+
+                }
+                else {
+
+                    Write-Host ""
+                    Write-Host "Windows service is not installed."
+                    Write-Host "Installing service using configured service account..."
+                    Write-Host "Installer : $InstallerPath"
+                    Write-Host "RunAs     : $ServiceRunAsUsername"
+
+                    if ([string]::IsNullOrWhiteSpace($ServiceRunAsUsername)) {
+                        throw "SERVICE_RUNAS_USERNAME is not configured."
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($ServiceRunAsPassword)) {
+                        throw "SERVICE_RUNAS_PASSWORD is not configured."
+                    }
+
+                    $SecureRunAsPassword = ConvertTo-SecureString `
+                        $ServiceRunAsPassword `
+                        -AsPlainText `
+                        -Force
+
+                    $RunAsCredential = New-Object `
+                        System.Management.Automation.PSCredential(
+                            $ServiceRunAsUsername,
+                            $SecureRunAsPassword
+                        )
+
+                    New-Service `
+                        -Name $ServiceName `
+                        -BinaryPathName "`"$InstallerPath`"" `
+                        -Credential $RunAsCredential `
+                        -StartupType Automatic `
+                        -ErrorAction Stop | Out-Null
+
+                    Start-Sleep -Seconds 2
+
+                    $InstalledService = Get-CimInstance `
+                        Win32_Service `
+                        -Filter "Name='$ServiceName'"
+
+                    if (-not $InstalledService) {
+
+                        throw `
+                            "Windows service '$ServiceName' was not created."
+                    }
+
+                    Write-Host "Windows service installed successfully."
+                    Write-Host "Service account: $ServiceRunAsUsername"
+                }
+
+                # ==========================================
+                # 9. VERIFY SERVICE
+                # ==========================================
+
+                Start-Sleep -Seconds 2
+
+                $InstalledService = Get-CimInstance `
+                    Win32_Service `
+                    -Filter "Name='$ServiceName'"
+
+                if (-not $InstalledService) {
+
+                    throw `
+                        "Windows service '$ServiceName' was not created."
+                }
+
+                Write-Host ""
+                Write-Host "Starting service..."
+
+                Start-Service `
+                    -Name $ServiceName `
+                    -ErrorAction Stop
+
+                Start-Sleep -Seconds 5
+
+                $InstalledService = Get-CimInstance `
+                    Win32_Service `
+                    -Filter "Name='$ServiceName'"
+
+                Write-Host ""
+                Write-Host "Service status:"
+                Write-Host "Name   : $($InstalledService.Name)"
+                Write-Host "State  : $($InstalledService.State)"
+                Write-Host "Status : $($InstalledService.Status)"
+
+                if ($InstalledService.State -ne "Running") {
+
+                    throw `
+                        "Service '$ServiceName' failed to start."
+                }
+
+                Write-Host ""
+                Write-Host "Deployment successful."
+            } `
+            -ArgumentList `
+                $Product.ServiceName,
+                $Product.ArtifactName,
+                $Product.Version,
+                $env:RELEASE_VERSION,
+                $BasePath,
+                $RemoteZip,
+                $env:WINDOWS_BACKUP_ROOT,
+                $env:IDENTITY_USERNAME,
+                $env:WINDOWS_APPLICATION_DRIVE,
+                $env:PROJECT_NAME,
+                $env:SERVICE_RUNAS_USERNAME,
+                $env:SERVICE_RUNAS_PASSWORD,
+                $env:DATASERVICE_SERVER_NAME,
+                $env:DATASERVICE_DB_PREFIX,
+                $env:DATASERVICE_IPIPAY_DATABASE,
+                $env:DATASERVICE_NFM_DATABASE,
+                $env:DATASERVICE_RUNTIME_DATABASE,
+                $env:DATASERVICE_DB_OPTIONS,
+                $env:SQL_USER,
+                $env:SQL_PASS,
+                $ResolvedValues
+    }
+
+    Write-Host ""
+    Write-Host "=================================================="
+    Write-Host "ALL WSI SERVICES DEPLOYED SUCCESSFULLY"
+    Write-Host "=================================================="
+
+}
+finally {
+
+    if ($Session) {
+
+        Write-Host ""
+        Write-Host "Closing PowerShell Remoting session..."
+
+        Remove-PSSession `
+            -Session $Session `
+            -ErrorAction SilentlyContinue
+    }
+}

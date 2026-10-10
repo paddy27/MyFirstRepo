@@ -1551,7 +1551,7 @@ try {
 
                     New-Service `
                         -Name $ServiceName `
-                        -BinaryPathName ""$InstallerPath"" `
+                        -BinaryPathName "`"$InstallerPath`"" `
                         -Credential $RunAsCredential `
                         -StartupType Automatic `
                         -ErrorAction Stop | Out-Null
